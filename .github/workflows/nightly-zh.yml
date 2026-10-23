@@ -29,6 +29,9 @@ env:
   MAIN_REPO: optiscaler/OptiScaler
   DLSSG_REPO: optiscaler/dlssg-to-fsr3
   UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'master' }}
+  # runner 的控制台是 cp1252，脚本里的中文输出需要强制 UTF-8（脚本内也有兜底）
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
 
 permissions:
   contents: write
@@ -89,6 +92,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # 让 PowerShell 按 UTF-8 解释 Python 的中文输出（否则日志与 coverage.txt 会变问号）
+          $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           Copy-Item -Recurse -Force 'zh\tools_cn' 'src\tools_cn'
 
           Write-Output '--- 字体补丁 ---'
