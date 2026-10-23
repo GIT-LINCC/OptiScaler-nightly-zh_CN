@@ -85,6 +85,7 @@ jobs:
           "version=$version"   >> $env:GITHUB_OUTPUT
           "filename=$filename" >> $env:GITHUB_OUTPUT
           "release_tag=$tag"   >> $env:GITHUB_OUTPUT
+          "date=$date"         >> $env:GITHUB_OUTPUT
           Write-Output "版本: $version / 包名: $filename.7z / tag: $tag"
 
       # 4) 注入汉化：CJK 字体补丁 + 译文，并做三道兜底校验
@@ -200,13 +201,18 @@ jobs:
           Get-ChildItem -Path $root -Recurse -File | Measure-Object -Property Length -Sum |
             ForEach-Object { Write-Output ("文件数 {0}，总大小 {1:N1} MB" -f $_.Count, ($_.Sum / 1MB)) }
 
-      # 8) 压缩（与官方同一条 7z 命令，官方会先把 fetcher 塞进 OptiScaler\）
+      # 8) 压缩：先进入 a\ 目录再打包，避免压缩包里多出 src\x64\Release\a 层级
       - name: Compress
         shell: pwsh
         run: |
           Copy-Item 'src\Streamlined_fetcher_windows.bat' 'src\x64\Release\a\OptiScaler' -Force
           $zipName = "${{ steps.ver.outputs.filename }}.7z"
-          7z a -r "$env:GITHUB_WORKSPACE\$zipName" "src\x64\Release\a\*.*"
+          Push-Location 'src\x64\Release\a'
+          try {
+            7z a -r "$env:GITHUB_WORKSPACE\$zipName" "*.*"
+          } finally {
+            Pop-Location
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.0
@@ -217,21 +223,16 @@ jobs:
           archive: false
           if-no-files-found: error
 
-      # 9) 发布说明：上游最近 commit + 汉化覆盖率
+      # 9) 发布说明：汉化覆盖率 + 上游变更链接（不再解析 git log，避免数组拼成 System.Object[]）
       - name: Generate changelog
         if: github.event_name == 'schedule' || github.event.inputs.make_release == 'true'
         shell: pwsh
-        working-directory: src
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          $since = if ($env:GITHUB_EVENT_NAME -eq 'schedule') { '1 day ago' } else { '3 days ago' }
-          $commits = git log --since="$since" --no-merges --first-parent --pretty=format:'- [%h](https://github.com/optiscaler/OptiScaler/commit/%H) %s (%an)'
-          if (-not $commits) { $commits = '- 上游最近没有新提交' }
-
           $coverage = '未知'
-          if (Test-Path '..\coverage.txt') {
-            $line = Get-Content '..\coverage.txt' -Encoding utf8 | Where-Object { $_ -match '界面文本' }
+          if (Test-Path 'coverage.txt') {
+            $line = Get-Content 'coverage.txt' -Encoding utf8 | Where-Object { $_ -match '界面文本' }
             if ($line) { $coverage = $line.Trim() }
           }
 
@@ -244,12 +245,12 @@ jobs:
             '- 说明：本包由个人汉化分支构建，**未做代码签名**（官方包由 SignPath 签名），首次运行可能触发 SmartScreen 提示。',
             '- 安装：解压后把全部文件放进游戏目录，运行 `setup_windows.bat`；目录结构与官方包一致，可与官方包互换。',
             '',
-            '### 上游最近变更',
+            '### 上游变更',
             '',
-            $commits
+            '官方 nightly 发布页：https://github.com/optiscaler/OptiScaler-nightly/releases'
           ) -join "`n"
 
-          $md | Out-File -FilePath '..\release_notes.md' -Encoding utf8
+          $md | Out-File -FilePath 'release_notes.md' -Encoding utf8
           Write-Output '发布说明已生成'
 
       - name: Publish release
@@ -257,7 +258,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.release_tag }}
-          name: Nightly zh-CN ${{ steps.ver.outputs.release_tag }}
+          name: Nightly-zh_CN-${{ steps.ver.outputs.date }}
           body_path: release_notes.md
           files: ${{ github.workspace }}/${{ steps.ver.outputs.filename }}.7z
           prerelease: true
