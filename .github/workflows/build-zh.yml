@@ -1,0 +1,188 @@
+name: Build zh-CN (self-contained)
+
+# 自包含汉化构建：从上游拉指定 commit，用本仓库 tools_cn/ 注入字体+译文，再编译。
+# 产物：OptiScaler_zh-CN_<ver>_<date>.7z（与官方包结构一致）
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '上游 optiscaler/OptiScaler 的分支或 commit'
+        required: false
+        default: 'f903b2c64b29c23ba84a706718a0455205483c18'
+      make_release:
+        description: '是否创建 GitHub Release'
+        type: boolean
+        required: false
+        default: true
+
+env:
+  BUILD_CONFIGURATION: Release
+  MAIN_REPO: optiscaler/OptiScaler
+  DLSSG_REPO: optiscaler/dlssg-to-fsr3
+  UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'f903b2c64b29c23ba84a706718a0455205483c18' }}
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout recipe (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: zh
+
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MAIN_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: src
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Extract version
+        id: ver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resourceFile = '.\src\OptiScaler\resource.h'
+          if (-not (Test-Path $resourceFile)) { throw "resource.h not found" }
+          function Get-Ver([string]$pattern) {
+            $line = Get-Content $resourceFile | Select-String -Pattern $pattern | Select-Object -First 1
+            if (-not $line) { throw "no match: $pattern" }
+            return ($line.Line -replace "#define\s+$pattern\s+", '').Trim()
+          }
+          $major = Get-Ver 'VER_MAJOR_VERSION'
+          $minor = Get-Ver 'VER_MINOR_VERSION'
+          $hotfix = Get-Ver 'VER_HOTFIX_VERSION'
+          $build = Get-Ver 'VER_BUILD_NUMBER'
+          $version = "v$major.$minor.$hotfix-pre$build"
+          $date = Get-Date -Format 'yyyyMMdd'
+          $filename = "OptiScaler_zh-CN_${version}_${date}"
+          $tag = "zh-build-$date-$(Get-Date -Format 'HHmmss')"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "filename=$filename" >> $env:GITHUB_OUTPUT
+          "release_tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Output "version=$version filename=$filename tag=$tag"
+
+      - name: Inject zh-CN
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          Write-Output '--- copy recipe ---'
+          Copy-Item -Recurse -Force 'zh\tools_cn' 'src\tools_cn'
+          Write-Output '--- font patch ---'
+          python src\tools_cn\cjk_patch.py --src src
+          if ($LASTEXITCODE -ne 0) { throw 'font patch failed' }
+          Write-Output '--- verify font patch ---'
+          python src\tools_cn\cjk_patch.py --src src --check
+          if ($LASTEXITCODE -ne 0) { throw 'font patch check failed' }
+          Write-Output '--- apply dict ---'
+          python src\tools_cn\apply_dict_v10.py --src src\OptiScaler\menu
+          if ($LASTEXITCODE -ne 0) { throw 'dict apply failed' }
+          Write-Output '--- verify CJK present ---'
+          $hasCjk = Select-String -Path 'src\OptiScaler\menu\menu_common.cpp' -Pattern '设置' -SimpleMatch -Quiet
+          if (-not $hasCjk) { throw 'no Chinese found in menu_common.cpp' }
+          $head = [System.IO.File]::ReadAllBytes('src\OptiScaler\menu\menu_common.cpp')[0..2]
+          if (-not ($head[0] -eq 0xEF -and $head[1] -eq 0xBB -and $head[2] -eq 0xBF)) {
+            throw 'menu_common.cpp missing UTF-8 BOM'
+          }
+          Write-Output 'inject OK'
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        working-directory: src
+        env:
+          CL: /utf-8
+        run: msbuild /m /p:Configuration=${{ env.BUILD_CONFIGURATION }} . /verbosity:minimal
+
+      - name: Bundle dlssg-to-fsr3 DLL
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $downloadDir = Join-Path $env:GITHUB_WORKSPACE 'dlssg-download'
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+          gh release download --repo $env:DLSSG_REPO --pattern '*.zip' --dir $downloadDir --clobber
+          $zipFile = Get-ChildItem -Path $downloadDir -Filter '*.zip' | Select-Object -First 1
+          if (-not $zipFile) { throw 'no dlssg zip' }
+          $extractPath = Join-Path $env:GITHUB_WORKSPACE 'dlssg-extracted'
+          Expand-Archive -Path $zipFile.FullName -DestinationPath $extractPath -Force
+          $dllName = 'dlssg_to_fsr3_amd_is_better.dll'
+          $dll = Get-ChildItem -Path $extractPath -Filter $dllName -Recurse | Select-Object -First 1
+          if (-not $dll) { throw "$dllName not in zip" }
+          $destDir = Join-Path $env:GITHUB_WORKSPACE 'src\x64\Release\a\OptiScaler'
+          New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+          Copy-Item $dll.FullName (Join-Path $destDir $dllName) -Force
+          Write-Output "bundled $dllName"
+
+      - name: Verify layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = 'src\x64\Release\a'
+          if (-not (Test-Path $root)) {
+            Write-Output 'a/ not found, listing x64\Release:'
+            Get-ChildItem 'src\x64\Release' -ErrorAction SilentlyContinue | Select-Object Name
+            throw 'package root missing'
+          }
+          $required = @(
+            'OptiScaler.dll','OptiScaler.ini','setup_windows.bat',
+            'OptiScaler\libxess.dll','OptiScaler\libxess_dx11.dll','OptiScaler\libxess_fg.dll',
+            'OptiScaler\libxell.dll','OptiScaler\amd_fidelityfx_upscaler_dx12.dll',
+            'OptiScaler\amd_fidelityfx_framegeneration_dx12.dll','OptiScaler\amd_fidelityfx_loader_dx12.dll',
+            'OptiScaler\dlssg_to_fsr3_amd_is_better.dll','OptiScaler\D3D12_OptiScaler\D3D12Core.dll'
+          )
+          $missing = @()
+          foreach ($f in $required) { if (-not (Test-Path (Join-Path $root $f))) { $missing += $f } }
+          if ($missing.Count -gt 0) {
+            Write-Output 'missing:'; $missing | ForEach-Object { Write-Output " - $_" }
+            throw 'layout incomplete'
+          }
+          Write-Output 'layout OK'
+          Get-ChildItem -Path $root -Recurse -File | Measure-Object -Property Length -Sum |
+            ForEach-Object { Write-Output ("files {0}, total {1:N1} MB" -f $_.Count, ($_.Sum / 1MB)) }
+
+      - name: Compress
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item 'src\Streamlined_fetcher_windows.bat' 'src\x64\Release\a\OptiScaler' -Force -ErrorAction SilentlyContinue
+          $zipName = "${{ steps.ver.outputs.filename }}.7z"
+          Push-Location 'src\x64\Release\a'
+          try { 7z a -r "$env:GITHUB_WORKSPACE\$zipName" "*.*" } finally { Pop-Location }
+          Get-Item "$env:GITHUB_WORKSPACE\$zipName" | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.filename }}
+          path: ${{ github.workspace }}\${{ steps.ver.outputs.filename }}.7z
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.event.inputs.make_release == 'true'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.ver.outputs.release_tag }}"
+          $zip = "${{ steps.ver.outputs.filename }}.7z"
+          $notes = @"
+          ## OptiScaler 汉化版（自建）
+
+          - 上游源码：``${{ env.MAIN_REPO }}@${{ env.UPSTREAM_REF }}``
+          - 版本：``${{ steps.ver.outputs.version }}``
+          - 汉化：基于 Lxg6 的 tools_cn 配方（dict_v10.json + CJK 内嵌字体）
+          - 未签名，首次运行可能有 SmartScreen 提示
+          "@
+          gh release create $tag "$env:GITHUB_WORKSPACE\$zip" --title "${{ steps.ver.outputs.filename }}" --notes $notes --repo ${{ github.repository }}
